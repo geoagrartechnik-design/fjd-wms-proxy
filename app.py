@@ -1,66 +1,88 @@
-from flask import Flask, request, Response
-import requests
-import xml.etree.ElementTree as ET
+"""WMS proxy for FJD Trion / ArcGIS Runtime and LGL BW boundary points."""
 import logging
+import xml.etree.ElementTree as ET
+from urllib.parse import urlsplit
+
+import requests
+from flask import Flask, Response, request
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 
-LGL = 'https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ALKIS_Grenzpunkte_Koordinatenqualitaet'
-SESSION = requests.Session()
+LGL = "https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ALKIS_Grenzpunkte_Koordinatenqualitaet"
+LAYER = "nora:v_al_grenzpunkt_q"
+HTTP = requests.Session()
 
-@app.get('/')
+
+@app.get("/")
 def home():
-    return 'FJD BW Grenzpunkte Proxy läuft!'
+    return "FJD BW Grenzpunkte Proxy läuft!"
 
-@app.get('/wms')
+
+@app.get("/wms")
 def wms():
-    # WMS parameter names are case-insensitive. Preserve values and avoid duplicate keys.
-    params = {k.upper(): v for k, v in request.args.items()}
-    action = params.get('REQUEST', 'GetCapabilities')
-    params['SERVICE'] = 'WMS'
-    params['REQUEST'] = action
+    # WMS parameter names are case-insensitive; remove duplicate mixed-case keys.
+    params = {key.upper(): value for key, value in request.args.items()}
+    action = params.get("REQUEST", "GetCapabilities")
+    operation = action.lower()
+    params["SERVICE"] = "WMS"
+    params["REQUEST"] = action
 
-    if action.lower() == 'getcapabilities':
-        # WMS 1.1.1 is supported by many agricultural mapping clients.
-        params['VERSION'] = '1.1.1'
-    elif action.lower() == 'getmap':
-        params.setdefault('VERSION', '1.1.1')
-        params.setdefault('LAYERS', 'nora:v_al_grenzpunkt_q')
-        params.setdefault('STYLES', '')
-        params.setdefault('FORMAT', 'image/png')
-        params.setdefault('TRANSPARENT', 'TRUE')
-        # WMS 1.1.1 uses SRS; WMS 1.3.0 uses CRS. Do not change BBOX/axis order.
-        if params['VERSION'] == '1.3.0' and 'CRS' not in params and 'SRS' in params:
-            params['CRS'] = params.pop('SRS')
-        elif params['VERSION'] != '1.3.0' and 'SRS' not in params and 'CRS' in params:
-            params['SRS'] = params.pop('CRS')
+    if operation == "getcapabilities":
+        # CRITICAL: Honor the client's requested version. ArcGIS Runtime requests
+        # 1.3.0; advertising 1.1.1 in response can trigger repeated retries.
+        params["VERSION"] = params.get("VERSION", "1.3.0")
+    elif operation == "getmap":
+        params.setdefault("VERSION", "1.3.0")
+        params.setdefault("LAYERS", LAYER)
+        params.setdefault("STYLES", "")
+        params.setdefault("FORMAT", "image/png")
+        params.setdefault("TRANSPARENT", "TRUE")
+        if params["VERSION"] == "1.3.0":
+            if "CRS" not in params and "SRS" in params:
+                params["CRS"] = params.pop("SRS")
+        elif "SRS" not in params and "CRS" in params:
+            params["SRS"] = params.pop("CRS")
+
+    app.logger.info("FJD REQUEST operation=%s version=%s crs=%s bbox=%s", action,
+                    params.get("VERSION"), params.get("CRS", params.get("SRS")),
+                    params.get("BBOX"))
 
     try:
-        upstream = SESSION.get(LGL, params=params, timeout=(10, 45))
-        app.logger.info('WMS %s status=%s type=%s', action, upstream.status_code, upstream.headers.get('Content-Type'))
-        content = upstream.content
-        content_type = upstream.headers.get('Content-Type', 'application/octet-stream')
+        upstream = HTTP.get(LGL, params=params, timeout=(10, 45))
+        body = upstream.content
+        content_type = upstream.headers.get("Content-Type", "application/octet-stream")
+        app.logger.info("LGL RESPONSE operation=%s status=%s type=%s bytes=%s",
+                        action, upstream.status_code, content_type, len(body))
 
-        if action.lower() == 'getcapabilities' and upstream.ok:
-            root = ET.fromstring(content)
-            endpoint = request.url_root.rstrip('/') + '/wms?'
+        if operation == "getcapabilities" and upstream.ok:
+            root = ET.fromstring(body)
+            actual_version = root.attrib.get("version", "unknown")
+            app.logger.info("CAPABILITIES version=%s root=%s", actual_version, root.tag)
+            endpoint = request.url_root.rstrip("/") + "/wms?"
+            # Both GetCapabilities and GetMap OnlineResource endpoints must point
+            # to this proxy, not directly to the original LGL service.
             for element in root.iter():
-                if element.tag.rsplit('}', 1)[-1] == 'OnlineResource':
-                    for key in list(element.attrib):
-                        if key.rsplit('}', 1)[-1] == 'href':
-                            element.set(key, endpoint)
-            content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
-            content_type = 'text/xml; charset=utf-8'
+                if element.tag.rsplit("}", 1)[-1] == "OnlineResource":
+                    for attribute in list(element.attrib):
+                        if attribute.rsplit("}", 1)[-1] == "href":
+                            element.set(attribute, endpoint)
+            body = ET.tostring(root, encoding="utf-8", xml_declaration=True)
+            content_type = "application/xml; charset=utf-8"
 
-        return Response(content, status=upstream.status_code, headers={
-            'Content-Type': content_type,
-            'Cache-Control': 'public, max-age=120' if action.lower() == 'getmap' and upstream.ok else 'no-store',
-            'Access-Control-Allow-Origin': '*',
+        if operation == "getmap" and upstream.ok and "image/" not in content_type.lower():
+            app.logger.warning("GetMap did not return an image: %s", body[:400])
+
+        return Response(body, status=upstream.status_code, headers={
+            "Content-Type": content_type,
+            "Cache-Control": "no-store",
+            "Access-Control-Allow-Origin": "*",
         })
     except requests.RequestException as exc:
-        app.logger.exception('Upstream WMS request failed')
-        return Response('WMS upstream request failed: ' + str(exc), status=502, content_type='text/plain')
-    except ET.ParseError:
-        app.logger.exception('Invalid capabilities XML from upstream')
-        return Response('Invalid capabilities XML from upstream', status=502, content_type='text/plain')
+        app.logger.exception("LGL request failed")
+        return Response("LGL request failed: " + str(exc), status=502,
+                        content_type="text/plain; charset=utf-8")
+    except ET.ParseError as exc:
+        app.logger.exception("LGL capabilities XML parsing failed")
+        return Response("LGL capabilities XML parsing failed: " + str(exc),
+                        status=502, content_type="text/plain; charset=utf-8")
