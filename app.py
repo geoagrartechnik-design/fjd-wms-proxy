@@ -1,60 +1,66 @@
-
 from flask import Flask, request, Response
 import requests
 import xml.etree.ElementTree as ET
+import logging
 
 app = Flask(__name__)
+logging.basicConfig(level=logging.INFO)
 
-LGL = (
-    "https://owsproxy.lgl-bw.de/owsproxy/ows/"
-    "WMS_LGL-BW_ALKIS_Grenzpunkte_Koordinatenqualitaet"
-)
+LGL = 'https://owsproxy.lgl-bw.de/owsproxy/ows/WMS_LGL-BW_ALKIS_Grenzpunkte_Koordinatenqualitaet'
+SESSION = requests.Session()
 
-@app.route("/")
+@app.get('/')
 def home():
-    return "FJD BW Grenzpunkte Proxy läuft!"
+    return 'FJD BW Grenzpunkte Proxy läuft!'
 
-@app.route("/wms")
+@app.get('/wms')
 def wms():
-    params = request.args.to_dict(flat=True)
-    action = params.get("REQUEST", params.get("request", "GetCapabilities"))
-    params["SERVICE"] = "WMS"
-    params["REQUEST"] = action
+    # WMS parameter names are case-insensitive. Preserve values and avoid duplicate keys.
+    params = {k.upper(): v for k, v in request.args.items()}
+    action = params.get('REQUEST', 'GetCapabilities')
+    params['SERVICE'] = 'WMS'
+    params['REQUEST'] = action
 
-    if action.lower() == "getcapabilities":
-        params["VERSION"] = "1.1.1"
+    if action.lower() == 'getcapabilities':
+        # WMS 1.1.1 is supported by many agricultural mapping clients.
+        params['VERSION'] = '1.1.1'
+    elif action.lower() == 'getmap':
+        params.setdefault('VERSION', '1.1.1')
+        params.setdefault('LAYERS', 'nora:v_al_grenzpunkt_q')
+        params.setdefault('STYLES', '')
+        params.setdefault('FORMAT', 'image/png')
+        params.setdefault('TRANSPARENT', 'TRUE')
+        # WMS 1.1.1 uses SRS; WMS 1.3.0 uses CRS. Do not change BBOX/axis order.
+        if params['VERSION'] == '1.3.0' and 'CRS' not in params and 'SRS' in params:
+            params['CRS'] = params.pop('SRS')
+        elif params['VERSION'] != '1.3.0' and 'SRS' not in params and 'CRS' in params:
+            params['SRS'] = params.pop('CRS')
 
     try:
-        r = requests.get(LGL, params=params, timeout=45)
-        r.raise_for_status()
+        upstream = SESSION.get(LGL, params=params, timeout=(10, 45))
+        app.logger.info('WMS %s status=%s type=%s', action, upstream.status_code, upstream.headers.get('Content-Type'))
+        content = upstream.content
+        content_type = upstream.headers.get('Content-Type', 'application/octet-stream')
 
-        content = r.content
-        content_type = r.headers.get(
-            "Content-Type", "application/octet-stream"
-        )
-
-        if action.lower() == "getcapabilities":
+        if action.lower() == 'getcapabilities' and upstream.ok:
             root = ET.fromstring(content)
-
+            endpoint = request.url_root.rstrip('/') + '/wms?'
             for element in root.iter():
-                if element.tag.split("}")[-1] in ("OnlineResource",):
+                if element.tag.rsplit('}', 1)[-1] == 'OnlineResource':
                     for key in list(element.attrib):
-                        if key.endswith("}href") or key == "href":
-                            element.set(
-                                key,
-                                request.url_root.rstrip("/") + "/wms?"
-                            )
+                        if key.rsplit('}', 1)[-1] == 'href':
+                            element.set(key, endpoint)
+            content = ET.tostring(root, encoding='utf-8', xml_declaration=True)
+            content_type = 'text/xml; charset=utf-8'
 
-            content = ET.tostring(
-                root, encoding="utf-8", xml_declaration=True
-            )
-            content_type = "text/xml"
-
-        return Response(content, content_type=content_type)
-
-    except Exception as e:
-        return Response(
-            "Proxy-Fehler: " + str(e),
-            status=502,
-            content_type="text/plain"
-        )
+        return Response(content, status=upstream.status_code, headers={
+            'Content-Type': content_type,
+            'Cache-Control': 'public, max-age=120' if action.lower() == 'getmap' and upstream.ok else 'no-store',
+            'Access-Control-Allow-Origin': '*',
+        })
+    except requests.RequestException as exc:
+        app.logger.exception('Upstream WMS request failed')
+        return Response('WMS upstream request failed: ' + str(exc), status=502, content_type='text/plain')
+    except ET.ParseError:
+        app.logger.exception('Invalid capabilities XML from upstream')
+        return Response('Invalid capabilities XML from upstream', status=502, content_type='text/plain')
